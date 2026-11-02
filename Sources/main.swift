@@ -75,6 +75,9 @@ struct AppMem: Identifiable {
     let name: String
     let bytes: UInt64
     let processes: Int
+    let app: NSRunningApplication?   // 有對應到一般 App 時才有，系統程序是 nil
+
+    var canQuit: Bool { app.map(Cleaner.isQuittable) ?? false }
 }
 
 enum ProcessReader {
@@ -107,10 +110,16 @@ enum ProcessReader {
             totals[key] = (old.bytes + info.ri_phys_footprint, old.count + 1)
         }
 
+        var appsByPath: [String: NSRunningApplication] = [:]
+        for a in NSWorkspace.shared.runningApplications {
+            if let path = a.bundleURL?.path { appsByPath[path] = a }
+        }
+
         return totals
             .sorted { $0.value.bytes > $1.value.bytes }
             .prefix(limit)
-            .map { AppMem(id: $0.key, name: displayName(for: $0.key), bytes: $0.value.bytes, processes: $0.value.count) }
+            .map { AppMem(id: $0.key, name: displayName(for: $0.key), bytes: $0.value.bytes,
+                          processes: $0.value.count, app: appsByPath[$0.key]) }
     }
 
     // 路徑裡第一個 .app 就是它所屬的 App；不在 .app 裡的就用執行檔本身
@@ -133,6 +142,57 @@ enum ProcessReader {
     }
 }
 
+// MARK: - 清理
+
+enum Cleaner {
+    // 結束後會讓系統不正常的程式，一律不碰
+    private static let protected: Set<String> = [
+        "com.apple.finder", "com.apple.dock", "com.apple.loginwindow", "com.apple.systemuiserver",
+        "com.apple.controlcenter", "com.apple.notificationcenterui", "com.apple.WindowManager",
+        "com.apple.Spotlight", "com.apple.TextInputMenuAgent",
+    ]
+
+    static func isQuittable(_ a: NSRunningApplication) -> Bool {
+        guard !a.isTerminated, a.processIdentifier != getpid() else { return false }
+        guard let id = a.bundleIdentifier, !protected.contains(id) else { return false }
+        return a.activationPolicy == .regular
+    }
+
+    // 有任何一般視窗（包含縮到 Dock、在其他桌面、被隱藏的）的程序
+    private static func pidsWithWindows() -> Set<pid_t> {
+        guard let list = CGWindowListCopyWindowInfo([.optionAll, .excludeDesktopElements], kCGNullWindowID)
+                as? [[String: Any]] else { return [] }
+        var pids = Set<pid_t>()
+        for w in list {
+            guard (w[kCGWindowLayer as String] as? Int) == 0,
+                  let pid = w[kCGWindowOwnerPID as String] as? Int,
+                  let b = w[kCGWindowBounds as String] as? [String: Any],
+                  let h = b["Height"] as? Double, h > 60 else { continue }
+            pids.insert(pid_t(pid))
+        }
+        return pids
+    }
+
+    // 開著但一個視窗都沒有、也不在前景的 App：關掉通常沒有任何影響
+    static func idleApps(from all: [AppMem]) -> [AppMem] {
+        let withWindows = pidsWithWindows()
+        return all.filter { m in
+            guard let a = m.app, isQuittable(a), !a.isActive else { return false }
+            return !withWindows.contains(a.processIdentifier)
+        }
+    }
+
+    // 用系統內建的 purge 清掉檔案快取，macOS 會跳出密碼視窗讓使用者自己輸入
+    static func purge() -> String? {
+        var error: NSDictionary?
+        let script = NSAppleScript(source: "do shell script \"/usr/sbin/purge\" with administrator privileges")
+        script?.executeAndReturnError(&error)
+        guard let error else { return nil }
+        if (error[NSAppleScript.errorNumber] as? Int) == -128 { return "已取消" }
+        return (error[NSAppleScript.errorMessage] as? String) ?? "執行失敗"
+    }
+}
+
 // MARK: - 狀態
 
 final class MemModel: ObservableObject {
@@ -142,7 +202,12 @@ final class MemModel: ObservableObject {
     @Published private(set) var top: [AppMem] = []
     @Published private(set) var history: [Double] = []
     @Published private(set) var launchAtLogin = SMAppService.mainApp.status == .enabled
+    @Published private(set) var idle: [AppMem] = []
+    @Published var confirmingIdle = false
+    @Published private(set) var cleanMessage: String?
+    @Published private(set) var busy = false
     private var timer: Timer?
+    private var messageClear: DispatchWorkItem?
 
     init() {
         refresh()
@@ -158,9 +223,59 @@ final class MemModel: ObservableObject {
 
     func refresh() {
         info = MemReader.read()
-        top = ProcessReader.topApps(limit: 8)
+        let all = ProcessReader.topApps(limit: 1000)
+        top = Array(all.prefix(8))
+        if !confirmingIdle { idle = Cleaner.idleApps(from: all) }
         history.append(info.ratio)
         if history.count > Self.historySize { history.removeFirst(history.count - Self.historySize) }
+    }
+
+    var idleBytes: UInt64 { idle.reduce(0) { $0 + $1.bytes } }
+
+    // 正常結束（等同按 ⌘Q），有未儲存的文件時 App 會自己詢問
+    func quit(_ apps: [AppMem]) {
+        let targets = apps.compactMap(\.app).filter(Cleaner.isQuittable)
+        guard !targets.isEmpty else { return }
+        let names = apps.filter { $0.app.map(Cleaner.isQuittable) ?? false }.map(\.name)
+        let before = MemReader.read().used
+        targets.forEach { $0.terminate() }
+        confirmingIdle = false
+        busy = true
+        // App 需要一點時間收尾，等 4 秒再量
+        DispatchQueue.main.asyncAfter(deadline: .now() + 4) { [weak self] in
+            guard let self else { return }
+            let still = targets.filter { !$0.isTerminated }.count
+            let freed = Int64(before) - Int64(MemReader.read().used)
+            var msg = names.count == 1 ? "已結束 \(names[0])" : "已結束 \(names.count - still) 個 App"
+            msg += freed > 0 ? "，釋放約 \(bytes(UInt64(freed)))" : "，用量沒有明顯變化"
+            if still > 0 { msg += "。有 \(still) 個 App 還在等你回應（可能在問要不要存檔）" }
+            self.finish(msg)
+        }
+    }
+
+    func purgeCache() {
+        busy = true
+        let before = MemReader.read()
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            if let err = Cleaner.purge() {
+                self.finish("沒有釋放快取：\(err)")
+                return
+            }
+            let after = MemReader.read()
+            let freed = Int64(before.cached) - Int64(after.cached)
+            self.finish(freed > 0 ? "已清掉約 \(bytes(UInt64(freed))) 的快取，之後會隨使用慢慢回來" : "快取已經很少，沒有可以清的")
+        }
+    }
+
+    private func finish(_ msg: String) {
+        busy = false
+        cleanMessage = msg
+        refresh()
+        messageClear?.cancel()
+        let w = DispatchWorkItem { [weak self] in self?.cleanMessage = nil }
+        messageClear = w
+        DispatchQueue.main.asyncAfter(deadline: .now() + 15, execute: w)
     }
 
     func setLaunchAtLogin(_ on: Bool) {
@@ -269,6 +384,79 @@ struct Legend: View {
     }
 }
 
+struct CleanSection: View {
+    @ObservedObject var model: MemModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("清理記憶體")
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(.secondary)
+
+            if model.confirmingIdle {
+                confirmBox
+            } else {
+                Button {
+                    model.confirmingIdle = true
+                } label: {
+                    Label(model.idle.isEmpty ? "沒有閒置的 App" : "結束閒置的 App（\(model.idle.count) 個，約 \(bytes(model.idleBytes))）",
+                          systemImage: "moon.zzz")
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .disabled(model.idle.isEmpty || model.busy)
+
+                Button {
+                    model.purgeCache()
+                } label: {
+                    Label("釋放系統快取（需要密碼）", systemImage: "arrow.3.trianglepath")
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .disabled(model.busy)
+
+                Text("閒置是指開著卻沒有任何視窗的 App。快取在需要時本來就會自動釋放，清掉只是暫時讓數字變小。")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            if model.busy {
+                HStack(spacing: 6) {
+                    ProgressView().controlSize(.small)
+                    Text("處理中...").font(.system(size: 11)).foregroundStyle(.secondary)
+                }
+            } else if let msg = model.cleanMessage {
+                Text(msg)
+                    .font(.system(size: 11))
+                    .foregroundStyle(.green)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .controlSize(.small)
+    }
+
+    private var confirmBox: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("將會結束這些 App：").font(.system(size: 12))
+            ForEach(model.idle) { a in
+                HStack {
+                    Text(a.name).lineLimit(1)
+                    Spacer()
+                    Text(bytes(a.bytes)).monospacedDigit().foregroundStyle(.secondary)
+                }
+                .font(.system(size: 11))
+            }
+            HStack {
+                Button("取消") { model.confirmingIdle = false }
+                Spacer()
+                Button("全部結束") { model.quit(model.idle) }
+                    .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(8)
+        .background(RoundedRectangle(cornerRadius: 6).fill(Color.secondary.opacity(0.08)))
+    }
+}
+
 struct PanelView: View {
     @ObservedObject var model: MemModel
     @AppStorage("showPercent") private var showPercent = true
@@ -324,10 +512,23 @@ struct PanelView: View {
                         }
                         Spacer()
                         Text(bytes(a.bytes)).monospacedDigit()
+                        if a.canQuit {
+                            Button { model.quit([a]) } label: {
+                                Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary)
+                            }
+                            .buttonStyle(.borderless)
+                            .help("結束 \(a.name)")
+                        } else {
+                            Image(systemName: "xmark.circle.fill").opacity(0)
+                        }
                     }
                     .font(.system(size: 12))
                 }
             }
+
+            Divider()
+
+            CleanSection(model: model)
 
             Divider()
 
