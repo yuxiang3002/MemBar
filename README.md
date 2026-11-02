@@ -1,3 +1,5 @@
+<img src="AppIcon.png" width="128" alt="MemBar 圖示">
+
 # MemBar
 
 macOS 選單列小工具，即時顯示記憶體用量、記憶體壓力和最吃記憶體的 App。

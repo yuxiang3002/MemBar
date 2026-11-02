@@ -29,14 +29,26 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
   <key>CFBundleIdentifier</key><string>local.membar</string>
   <key>CFBundleExecutable</key><string>MemBar</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>1.1</string>
+  <key>CFBundleShortVersionString</key><string>1.2</string>
   <key>CFBundleVersion</key><string>1</string>
   <key>LSMinimumSystemVersion</key><string>13.0</string>
+  <key>CFBundleIconFile</key><string>AppIcon</string>
   <key>LSUIElement</key><true/>
   <key>NSHighResolutionCapable</key><true/>
 </dict>
 </plist>
 PLIST
+
+# 用 AppIcon.png 產生 macOS 圖示（sips 和 iconutil 都是系統內建工具）
+if [ -f AppIcon.png ]; then
+  ICONSET="build/AppIcon.iconset"
+  mkdir -p "$ICONSET" "$APP/Contents/Resources"
+  for s in 16 32 128 256 512; do
+    sips -z $s $s AppIcon.png --out "$ICONSET/icon_${s}x${s}.png" >/dev/null
+    sips -z $((s*2)) $((s*2)) AppIcon.png --out "$ICONSET/icon_${s}x${s}@2x.png" >/dev/null
+  done
+  iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/AppIcon.icns"
+fi
 
 codesign --force --deep --sign - "$APP"
 
