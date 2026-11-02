@@ -29,8 +29,8 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
   <key>CFBundleIdentifier</key><string>local.membar</string>
   <key>CFBundleExecutable</key><string>MemBar</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>1.2</string>
-  <key>CFBundleVersion</key><string>1</string>
+  <key>CFBundleShortVersionString</key><string>1.3</string>
+  <key>CFBundleVersion</key><string>13</string>
   <key>LSMinimumSystemVersion</key><string>13.0</string>
   <key>CFBundleIconFile</key><string>AppIcon</string>
   <key>LSUIElement</key><true/>
@@ -55,5 +55,11 @@ codesign --force --deep --sign - "$APP"
 pkill -x MemBar 2>/dev/null || true
 rm -rf /Applications/MemBar.app
 cp -R "$APP" /Applications/
+# 只讓系統認得「應用程式」裡的版本，build 裡的副本不登記，免得顯示到舊圖示
+LSREG=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
+"$LSREG" -u "$PWD/$APP" 2>/dev/null || true
+# 暫存的 build 副本用完就刪，系統只會認得「應用程式」裡那一份
+rm -rf build
+"$LSREG" -f /Applications/MemBar.app 2>/dev/null || true
 echo "完成，已安裝到 /Applications/MemBar.app"
 open /Applications/MemBar.app
